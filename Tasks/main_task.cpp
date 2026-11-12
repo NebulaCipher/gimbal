@@ -81,10 +81,12 @@ void MainInit(void) {
   // 速度环积分补偿持续扰动力矩：积分状态限幅 1，积分力矩最多 0.5 N·m。
   // 仍需实车整定，总力矩限幅保持 4 N·m。
   torque_pid.init(1.0f, 0.5f, 0.0f, 4.0f, 1.0f);
-  // 重力由前馈承担，先关闭积分核对反馈方向和阻尼，再按实车整定。
-  // 角度环与摇杆均限速 0.15 rad/s，避免小幅操作积累过快。
-  pitch_pid.init(2.0f, 0.0f, 0.0f, 0.15f, 0.0f);
-  pitch_torque_pid.init(4.0f, 0.0f, 0.0f, pitch_torque_limit, 0.0f);
+  // pitch 位置环用 P，速度环用 PI，重力仍由原前馈承担。
+  // 位置环 Kp=4，回正目标速度限幅 0.5 rad/s；摇杆目标仍按 0.15 rad/s 更新。
+  pitch_pid.init(4.0f, 0.0f, 0.0f, 0.5f, 0.0f);
+  // Kp=12 增强速度跟踪；Ki=2、积分状态限幅 0.5，积分力矩最多 1 N·m。
+  // 总力矩仍限幅 9 N·m；这组参数是待实车整定的初值。
+  pitch_torque_pid.init(12.0f, 2.0f, 0.0f, pitch_torque_limit, 0.5f);
   ImuInit();
   MX_IWDG_Init();
   CanFilter_Init(&hcan1);
