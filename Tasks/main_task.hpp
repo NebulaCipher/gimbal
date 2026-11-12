@@ -18,6 +18,8 @@
 
 
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
@@ -35,5 +37,6 @@ void MainTask(void);
 
 #ifdef __cplusplus
 }
+void Decode_Chassis(const uint8_t *data);
 #endif /* __cplusplus */
 #endif /* __MAIN_TASK_HPP__ */

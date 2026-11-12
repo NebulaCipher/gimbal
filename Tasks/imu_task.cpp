@@ -26,6 +26,10 @@ hello_world::imu::BMI088 *bmi088_ptr = nullptr;
 hello_world::ahrs::Mahony *mahony_ptr = nullptr;
 float acc_data[3], gyro_data[3], temp;
 float quat[4];
+// 上电前 1000 次采样保持静止，计算三轴陀螺仪偏置（rad/s）。
+static float gyro_bias[3] = {0.0f, 0.0f, 0.0f};
+static uint32_t gyro_bias_samples = 0;
+static constexpr uint32_t kGyroBiasSampleCount = 1000;
 /* External variables --------------------------------------------------------*/
 
 float euler_angles[3];
@@ -58,7 +62,9 @@ void ImuInit() {
   float mahony_init_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
   float sample_freq = 1000.0f;
   bmi088_ptr = new hello_world::imu::BMI088(default_params, rot_mat_flatten);
-  bmi088_ptr->imuInit();
+  if (bmi088_ptr->imuInit() != hello_world::imu::kBMI088ErrStateNoErr) {
+    Error_Handler();
+  }
   mahony_ptr = new hello_world::ahrs::Mahony(mahony_init_quat, sample_freq,
                                              mahony_kp, mahony_ki);
 }
@@ -70,6 +76,20 @@ void ImuInit() {
  */
 void ImuUpdate() {
   bmi088_ptr->getData(acc_data, gyro_data, &temp);
+  if (gyro_bias_samples < kGyroBiasSampleCount) {
+    for (int axis = 0; axis < 3; ++axis) {
+      gyro_bias[axis] += gyro_data[axis];
+    }
+    if (++gyro_bias_samples == kGyroBiasSampleCount) {
+      for (int axis = 0; axis < 3; ++axis) {
+        gyro_bias[axis] /= static_cast<float>(kGyroBiasSampleCount);
+      }
+    }
+    return;  // 标定期间不积分未校正的角速度。
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    gyro_data[axis] -= gyro_bias[axis];
+  }
   mahony_ptr->update(acc_data, gyro_data);
   mahony_ptr->getQuat(quat);
   Quat2Euler(quat, euler_angles);

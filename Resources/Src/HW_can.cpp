@@ -17,6 +17,10 @@
 #include "stdint.h"
 
 #include "dm4310_drv.hpp"
+#include "main_task.hpp"
+extern Joint_Motor_t yaw_motor_t;
+extern volatile uint32_t yaw_feedback_count;
+extern volatile uint32_t yaw_feedback_last_tick;
 /* Private macro -------------------------------------------------------------*/
 /* Private constants ---------------------------------------------------------*/
 /* Private types -------------------------------------------------------------*/
@@ -88,8 +92,15 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header1, can1_rx_data) ==
         HAL_OK) // 获得接收到的数据头和数据
     {
-      if (rx_header1.StdId == 0x200) { // 帧头校验
-                                       // 校验通过进行具体数据处理
+      if (rx_header1.IDE == CAN_ID_STD && rx_header1.RTR == CAN_RTR_DATA &&
+          rx_header1.DLC == 8) {
+        if (rx_header1.StdId == 0x13 && (can1_rx_data[0] & 0x0F) == 3) {
+          dm4310_fbdata(&yaw_motor_t, can1_rx_data, rx_header1.DLC);
+          yaw_feedback_last_tick = HAL_GetTick();
+          yaw_feedback_count++;
+        } else if (rx_header1.StdId == 0x510 && can1_rx_data[2] <= 1) {
+          Decode_Chassis(can1_rx_data);
+        }
       }
     }
   }

@@ -1,0 +1,20 @@
+/*
+!/components
+!/Resources
+!/Tasks
+!*.ioc
+
+# Keep the complete firmware project and its verification sources.
+!/.gitignore
+!/CMakeLists.txt
+!/CMakePresets.json
+!/cmake/
+!/Core/
+!/Drivers/
+!/*.ld
+!/*.s
+!/*.c
+!/*.h
+!/tests/
+!/README.md
+__pycache__/
