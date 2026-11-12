@@ -26,6 +26,8 @@ hello_world::imu::BMI088 *bmi088_ptr = nullptr;
 hello_world::ahrs::Mahony *mahony_ptr = nullptr;
 float acc_data[3], gyro_data[3], temp;
 float quat[4];
+// Ozone 调试用：0xFF 表示尚未完成初始化，0 表示成功，其余为 BMI088 错误位。
+volatile uint8_t imu_init_error = 0xFF;
 // 上电前 1000 次采样保持静止，计算三轴陀螺仪偏置（rad/s）。
 static float gyro_bias[3] = {0.0f, 0.0f, 0.0f};
 static uint32_t gyro_bias_samples = 0;
@@ -62,7 +64,8 @@ void ImuInit() {
   float mahony_init_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
   float sample_freq = 1000.0f;
   bmi088_ptr = new hello_world::imu::BMI088(default_params, rot_mat_flatten);
-  if (bmi088_ptr->imuInit() != hello_world::imu::kBMI088ErrStateNoErr) {
+  imu_init_error = bmi088_ptr->imuInit();
+  if (imu_init_error != hello_world::imu::kBMI088ErrStateNoErr) {
     Error_Handler();
   }
   mahony_ptr = new hello_world::ahrs::Mahony(mahony_init_quat, sample_freq,

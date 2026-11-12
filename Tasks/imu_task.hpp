@@ -24,6 +24,9 @@
 /* Exported variables --------------------------------------------------------*/
 
 extern float euler_angles[3];
+extern volatile uint8_t imu_init_error;
+extern volatile uint8_t imu_gyro_chip_id;
+extern volatile uint32_t imu_gyro_spi_status;
 /* Exported function prototypes ----------------------------------------------*/
 
 void ImuInit();

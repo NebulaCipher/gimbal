@@ -31,6 +31,10 @@
 #include <cstring>
 #include "spi.h"
 
+// 保留陀螺仪 ID 和 SPI 返回状态，便于在 Ozone 定位初始化失败。
+volatile uint8_t imu_gyro_chip_id = 0xFF;
+volatile uint32_t imu_gyro_spi_status = HAL_ERROR;
+
 namespace hello_world
 {
 namespace imu
@@ -303,8 +307,19 @@ BMI088ErrState BMI088::accInit(bool self_test) const
 
 BMI088ErrState BMI088::gyroInit(bool self_test) const
 {
-  tick::DelayUs(kCommWaitTimeUs);
-  if (gyroRead(BMI088_GYRO_GYRO_CHIP_ID) != BMI088_GYRO_GYRO_CHIP_ID_VALUE) {
+  // MCU 复位不等于传感器断电，给启动或通信恢复留出有限等待时间。
+  // 每次仍验证真实 ID，持续失败则保留原有报错处理。
+  for (int i = 0; i < 10; ++i) {
+    tick::DelayUs(kCommWaitTimeUs);
+    imu_gyro_chip_id = gyroRead(BMI088_GYRO_GYRO_CHIP_ID);
+    if (imu_gyro_spi_status == HAL_OK &&
+        imu_gyro_chip_id == BMI088_GYRO_GYRO_CHIP_ID_VALUE) {
+      break;
+    }
+    HAL_Delay(10);
+  }
+  if (imu_gyro_spi_status != HAL_OK ||
+      imu_gyro_chip_id != BMI088_GYRO_GYRO_CHIP_ID_VALUE) {
     return kBMI088ErrStateGyroNotFound;
   }
 
@@ -454,10 +469,12 @@ void BMI088::gyroWrite(uint8_t mem_addr, uint8_t value) const
 
 uint8_t BMI088::gyroRead(uint8_t mem_addr) const
 {
-  uint8_t rx_data[2], tx_data[2] = {mem_addr |= kReadSign, kPaddingValue};
+  uint8_t rx_data[2] = {};
+  uint8_t tx_data[2] = {static_cast<uint8_t>(mem_addr | kReadSign), kPaddingValue};
   gyroCsL();
-  HAL_SPI_TransmitReceive(hspi_, tx_data, rx_data, 2, kSpiTimeout);
+  HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(hspi_, tx_data, rx_data, 2, kSpiTimeout);
   gyroCsH();
+  if (mem_addr == BMI088_GYRO_GYRO_CHIP_ID) imu_gyro_spi_status = status;
 
   return rx_data[1];
 }
