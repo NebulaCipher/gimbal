@@ -48,19 +48,29 @@ HARNESS = r"""
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+// Fail on stderr instead of opening a Windows CRT assertion dialog.
+#undef assert
+#define assert(condition) do { if (!(condition)) { \
+  std::cerr << "Assertion failed at line " << __LINE__ << ": " << #condition << '\n'; \
+  std::exit(1); \
+} } while (false)
 extern "C" void MainInit();
 extern "C" void MainTask();
 void Decode_Chassis(const uint8_t *);
 void Send_To_Chassis();
 extern uint32_t tick;
 extern volatile uint32_t yaw_feedback_count, yaw_feedback_last_tick;
-extern float position, torque;
+extern float position, torque, gimbal_omega, yaw_target_omega;
+extern Joint_Motor_t yaw_motor_t;
 extern bool gimbal_ready;
 extern DM4340_Motor_t pitch_motor_t;
 extern volatile uint32_t pitch_feedback_count, pitch_feedback_last_tick;
 extern bool pitch_control_enabled;
 extern float pitch_motor_min, pitch_motor_max, pitch_motor_direction;
 extern float pitch_position, pitch_omega, pitch_torque;
+extern float pitch_target_omega, pitch_pid_torque;
+extern float pitch_gravity_gain, pitch_gravity_angle, pitch_gravity_torque;
+extern float pitch_torque_limit;
 CAN_HandleTypeDef hcan1, hcan2;
 TIM_HandleTypeDef htim6;
 IWDG_HandleTypeDef hiwdg;
@@ -144,6 +154,9 @@ void pitch_step(bool enabled, float input) {
 }
 int main() {
   MainInit();
+  assert(pitch_gravity_gain == 7.0f && pitch_torque_limit == 9.0f);
+  // Isolate feedback-only regressions before testing the configured feedforward.
+  pitch_gravity_gain = 0;
   assert(enables == 1);
   assert(pitch_enables == 1);
   for (int i = 0; i < 2000; ++i) {
@@ -188,6 +201,84 @@ int main() {
   assert(watchdog_refreshes > 0);
   std::cout << "yaw task: startup, control, disable, timeouts, recovery, wrap and telemetry passed\n";
 
+  // A pitched/rolled IMU must report Euler yaw rate, not local gyro Z.
+  command(false);
+  step();
+  euler_angles[0] = 0.6f;
+  euler_angles[1] = 0.5f;
+  euler_angles[2] = 0.3f;
+  command(true);
+  step();
+  const float held_yaw = position;
+  gyro_data[0] = -2.0f * std::sin(euler_angles[1]);
+  gyro_data[1] = 2.0f * std::sin(euler_angles[2]) * std::cos(euler_angles[1]);
+  gyro_data[2] = 2.0f * std::cos(euler_angles[2]) * std::cos(euler_angles[1]);
+  step();
+  assert(std::fabs(gimbal_omega - 2.0f) < 1e-6f && sent_torque < 0);
+  assert(position == held_yaw && yaw_target_omega == 0);
+  // Pure pitch motion must not masquerade as yaw motion when roll is nonzero.
+  gyro_data[0] = 0;
+  gyro_data[1] = 0.4f * std::cos(euler_angles[2]);
+  gyro_data[2] = -0.4f * std::sin(euler_angles[2]);
+  step();
+  assert(std::fabs(gimbal_omega) < 1e-6f);
+  euler_angles[1] = 1.57079632679f;
+  step(); // Near-vertical guard must keep control finite and bounded.
+  assert(std::isfinite(gimbal_omega));
+  std::memset(gyro_data, 0, sizeof(gyro_data));
+  euler_angles[1] = euler_angles[2] = 0;
+
+  // Cross +/-pi using the short angular error; the target must stay fixed.
+  command(false);
+  step();
+  euler_angles[0] = 3.14159265359f - 0.02f;
+  command(true);
+  step();
+  euler_angles[0] = -3.14159265359f + 0.02f;
+  step();
+  assert(yaw_target_omega < -0.19f && yaw_target_omega > -0.21f);
+
+  // Illustrative joint dynamics, not a model of the real vehicle. Verify that
+  // a displaced heading recovers despite a constant 0.2 Nm load, both with a
+  // stationary chassis and a spinning chassis (relative motor angle changes).
+  for (float chassis_rate : {0.0f, 4.712389f}) {
+    command(false);
+    step();
+    euler_angles[0] = 0.6f;
+    gyro_data[2] = 0;
+    command(true);
+    step();
+    assert(sent_torque == 0); // Integral cleared on disable/recovery.
+    euler_angles[0] += 0.1f; // External heading displacement.
+    float speed = 0;
+    for (int i = 0; i < 20000; ++i) {
+      if (i % 10 == 0) command(true);
+      yaw_motor_t.para.pos = std::remainder(
+          euler_angles[0] - chassis_rate * i * 0.001f, 6.28318530718f);
+      step();
+      assert(std::fabs(position - 0.6f) < 1e-6f);
+      speed += (sent_torque + 0.2f - 0.05f * speed) / 0.15f * 0.001f;
+      euler_angles[0] += speed * 0.001f;
+      gyro_data[2] = speed;
+    }
+    assert(std::fabs(euler_angles[0] - position) < 0.002f);
+    assert(std::fabs(sent_torque + 0.2f) < 0.01f);
+  }
+  // A blocked joint cannot accumulate more than 0.5 Nm integral torque.
+  euler_angles[0] = position - 0.2f;
+  gyro_data[2] = 0;
+  for (int i = 0; i < 3000; ++i) {
+    if (i % 10 == 0) command(true);
+    step();
+  }
+  assert(std::fabs(sent_torque - yaw_target_omega) <= 0.50001f);
+  command(false);
+  step();
+  command(true);
+  step();
+  assert(sent_torque == 0);
+  std::cout << "yaw hold: tilted IMU, wrap, disturbance recovery, rotating chassis and bounded/reset integral passed\n";
+
   // Feedback packing and independent model ranges (yaw stays unchanged).
   uint8_t raw_pitch[8] = {0x19, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 45, 50};
   dm4340_fbdata(&pitch_motor_t, raw_pitch, 8);
@@ -203,90 +294,175 @@ int main() {
   assert(pitch_motor_t.para.pos == DM4340_P_MIN);
   assert(pitch_motor_t.para.vel == -10 && pitch_motor_t.para.tor == -28);
 
-  // Unknown travel: calibration mode sends zero torque despite stick input.
-  pitch_motor_t.para.pos = 0;
+  // The IMU stays on the yaw bracket: pitch must use DM4340 pos/vel only.
+  const float motor_middle = (pitch_motor_min + pitch_motor_max) * 0.5f;
+  pitch_motor_t.para.pos = motor_middle;
+  pitch_motor_t.para.vel = 0;
   pitch_feedback_count = 1;
   pitch_feedback_last_tick = now;
-  euler_angles[1] = 0.2f;
-  pitch_step(true, 1);
-  assert(pitch_torque == 0);
-  assert(((pitch_frame[6] & 15) << 8 | pitch_frame[7]) == 2047);
-  pitch_control_enabled = true;
-  pitch_step(true, 1);
-  assert(pitch_torque == 0); // Invalid min == max.
-
-  pitch_motor_min = -0.4f;
-  pitch_motor_max = 0.6f;
+  euler_angles[1] = -0.036f;
   pitch_step(true, 0);
-  assert(std::fabs(pitch_position - 0.2f) < 1e-6f && pitch_torque == 0);
+  assert(pitch_position == motor_middle && pitch_torque == 0);
   pitch_step(true, 1);
-  assert(pitch_position > 0.2f && pitch_torque > 0);
-  float held = pitch_position;
+  assert(pitch_position < motor_middle && pitch_torque < 0); // Up = negative.
+  const float held = pitch_position;
   pitch_step(true, 0);
   assert(pitch_position == held);
-  // Changing earth attitude at fixed joint angle creates compensation torque.
+  pitch_motor_t.para.pos = held + 0.03f;
+  pitch_step(true, 0);
+  assert(pitch_torque < 0); // Displaced downward: lift back to target.
+  pitch_motor_t.para.pos = held - 0.03f;
+  pitch_step(true, 0);
+  assert(pitch_torque > 0); // Overshot upward: correct downward.
+  pitch_motor_t.para.pos = held;
+  pitch_motor_t.para.vel = -0.2f;
+  pitch_step(true, 0);
+  assert(pitch_omega == -0.2f && pitch_torque > 0); // Brake upward motion.
+  pitch_motor_t.para.vel = 0.2f;
+  pitch_step(true, 0);
+  assert(pitch_torque < 0); // Brake downward motion.
+  pitch_motor_t.para.vel = 0;
   euler_angles[1] += 0.1f;
+  gyro_data[1] = 1.0f;
   pitch_step(true, 0);
-  assert(pitch_torque < 0);
-  gyro_data[1] = 0.2f;
-  pitch_step(true, 0);
-  assert(std::fabs(pitch_omega - 0.2f) < 1e-6f);
+  assert(pitch_position == held && pitch_omega == 0 && pitch_torque == 0);
   gyro_data[1] = 0;
 
-  // Upper bound: suppress outward torque, retain inward recovery.
-  pitch_motor_t.para.pos = pitch_motor_max;
-  pitch_position = euler_angles[1] + 1;
-  for (int i = 0; i < 100; ++i) pitch_step(true, 1);
-  assert(pitch_position <= euler_angles[1] + 1e-6f && pitch_torque == 0);
-  pitch_step(true, -1);
-  assert(pitch_torque < 0);
-  // An external inward movement must not cause outward braking at the stop.
-  gyro_data[1] = -0.2f;
+  // Reduced speed limit and no integral windup with a blocked motor.
+  pitch_position = motor_middle - 0.3f;
+  for (int i = 0; i < 10000; ++i) {
+    pitch_step(true, 0);
+    assert(std::fabs(pitch_torque + 0.6f) < 1e-6f);
+  }
+  assert(std::fabs(pitch_target_omega + 0.15f) < 1e-6f);
+  const int lift_raw = ((pitch_frame[6] & 15) << 8) | pitch_frame[7];
+  assert(std::fabs(uint_to_float(lift_raw, -28, 28, 12) - pitch_torque) < 0.014f);
+  pitch_motor_t.para.vel = 5;
   pitch_step(true, 0);
-  assert(pitch_torque == 0);
-  gyro_data[1] = 0;
+  assert(pitch_torque == -pitch_torque_limit);
+  pitch_motor_t.para.vel = 0;
+
+  // Illustrative motor dynamics, matched gravity, fixed bracket IMU.
+  pitch_step(false, 0);
+  pitch_motor_t.para.pos = motor_middle;
+  pitch_gravity_gain = 7.0f;
+  pitch_gravity_angle = motor_middle;
+  euler_angles[1] = -0.036f;
+  pitch_step(true, 0);
+  assert(std::fabs(pitch_torque + 7.0f) < 1e-6f);
+  const float target = motor_middle - 0.05f;
+  pitch_position = target;
+  for (int i = 0; i < 30000; ++i) {
+    now++;
+    pitch_feedback_last_tick = now;
+    pitch_step(true, 0);
+    assert(std::fabs(pitch_torque) <= pitch_torque_limit);
+    assert(pitch_position == target);
+    assert(std::fabs(pitch_target_omega) <= 0.15f);
+    const float load = 7.0f * std::cos(pitch_motor_t.para.pos - motor_middle);
+    pitch_motor_t.para.vel += (pitch_torque + load -
+        0.2f * pitch_motor_t.para.vel) / 0.2f * 0.001f;
+    pitch_motor_t.para.pos += pitch_motor_t.para.vel * 0.001f;
+    assert(pitch_motor_t.para.pos > pitch_motor_min &&
+           pitch_motor_t.para.pos < pitch_motor_max);
+  }
+  assert(std::fabs(pitch_motor_t.para.pos - target) < 0.002f);
+  assert(euler_angles[1] == -0.036f); // No gun-mounted IMU required.
+  pitch_step(false, 0);
+  pitch_motor_t.para.vel = 0;
+  pitch_step(true, 0);
+  assert(pitch_position == pitch_motor_t.para.pos);
+  assert(std::fabs(pitch_pid_torque) < 1e-6f);
+  assert(std::fabs(pitch_torque - pitch_gravity_torque) < 1e-6f);
+
+  // Gravity phase is a motor position; bracket IMU pitch cannot change it.
+  pitch_step(false, 0);
+  pitch_motor_t.para.pos = 0;
+  pitch_gravity_angle = 0;
+  pitch_step(true, 0);
+  assert(std::fabs(pitch_gravity_torque + 7.0f) < 1e-6f);
+  euler_angles[1] = 0.2f;
+  pitch_step(true, 0);
+  assert(std::fabs(pitch_torque + 7.0f) < 1e-6f);
+  pitch_motor_t.para.pos = pitch_position = -0.2f;
+  pitch_step(true, 0);
+  assert(std::fabs(pitch_gravity_torque + 7.0f * std::cos(0.2f)) < 1e-6f);
+  pitch_gravity_gain = 2 * pitch_torque_limit;
+  pitch_step(true, 0);
+  assert(pitch_torque == -pitch_torque_limit);
+  pitch_gravity_gain = 7;
+  pitch_motor_t.para.pos = pitch_motor_min;
+  pitch_step(true, 1);
+  assert(pitch_torque == 0); // Feedforward must obey the raising limit.
+  pitch_motor_t.para.pos = pitch_motor_max;
+  pitch_step(true, 0);
+  assert(pitch_torque < 0); // Inward feedforward remains permitted.
+  pitch_step(false, 0);
+  assert(pitch_torque == 0 && pitch_gravity_torque == 0);
+  assert(pitch_target_omega == 0 && pitch_pid_torque == 0);
+  now += 101;
+  pitch_step(true, 0);
+  assert(pitch_torque == 0 && pitch_gravity_torque == 0);
+  pitch_gravity_gain = 0;
+  pitch_feedback_last_tick = now;
+  pitch_motor_t.para.pos = motor_middle;
+  pitch_step(true, 0);
+  assert(pitch_position == motor_middle && pitch_torque == 0);
+
+  // Motor-coordinate limits clamp the target and allow inward recovery.
+  pitch_motor_t.para.pos = pitch_motor_min;
+  pitch_position = pitch_motor_min - 1;
+  pitch_step(true, 1);
+  assert(pitch_position == pitch_motor_min && pitch_torque == 0);
+  pitch_step(true, -1);
+  assert(pitch_torque > 0);
+  pitch_motor_t.para.pos = pitch_motor_max;
+  pitch_position = pitch_motor_max + 1;
+  pitch_step(true, -1);
+  assert(pitch_position == pitch_motor_max && pitch_torque == 0);
+  pitch_step(true, 1);
+  assert(pitch_torque < 0);
+  pitch_motor_t.para.vel = -0.2f;
+  pitch_step(true, 0);
+  assert(pitch_torque == 0); // Outward braking is still forbidden at a stop.
+  pitch_motor_t.para.vel = 0;
   pitch_motor_t.para.pos = pitch_motor_max + 0.05f;
   pitch_step(true, 0);
-  assert(pitch_torque < 0); // Out-of-range recovery.
+  assert(pitch_torque < 0); // Outside travel: recover inward.
 
-  pitch_motor_t.para.pos = pitch_motor_min;
-  pitch_position = euler_angles[1] - 1;
-  pitch_step(true, -1);
-  assert(pitch_torque == 0);
-  pitch_step(true, 1);
-  assert(pitch_torque > 0);
-  // Reversed installation: clamp and torque sign both follow motor coordinates.
-  pitch_motor_direction = -1;
-  pitch_position = euler_angles[1];
+  // Calibration, invalid feedback and recovery recapture motor position.
+  pitch_control_enabled = false;
   pitch_step(true, 1);
   assert(pitch_torque == 0);
-  pitch_step(true, -1);
-  assert(pitch_torque > 0);
-  pitch_motor_t.para.pos = pitch_motor_max;
-  pitch_position = euler_angles[1];
-  pitch_step(true, -1);
-  assert(pitch_torque == 0);
+  pitch_control_enabled = true;
+  pitch_motor_min = pitch_motor_max = 0;
   pitch_step(true, 1);
-  assert(pitch_torque < 0);
-
-  pitch_step(false, 1);
   assert(pitch_torque == 0);
-  now += 101;
-  pitch_step(true, 1);
-  assert(pitch_torque == 0); // Stale pitch feedback.
-  pitch_feedback_last_tick = now;
+  pitch_motor_min = -0.4f;
+  pitch_motor_max = 0.6f;
   pitch_motor_t.para.pos = 0;
-  euler_angles[1] = -0.1f;
+  pitch_motor_t.para.vel = NAN;
+  pitch_step(true, 1);
+  assert(pitch_torque == 0);
+  pitch_motor_t.para.vel = 0;
   pitch_step(true, 0);
-  assert(pitch_position == euler_angles[1] && pitch_torque == 0);
+  assert(pitch_position == 0 && pitch_torque == 0);
+  pitch_motor_direction = 1;
+  pitch_step(true, 1);
+  assert(pitch_position > 0 && pitch_torque > 0);
+  pitch_step(false, 0);
+  pitch_motor_direction = -1;
+  pitch_step(true, 0);
+  assert(pitch_position == 0 && pitch_torque == 0);
 
-  // Full task wiring: byte 3 from the lower board drives pitch.
+  // Full task wiring: byte 3 from the lower board raises the gun.
   uint8_t command_frame[8] = {0, 0, 1, 255, 127, 0, 0, 0};
   Decode_Chassis(command_frame);
   yaw_feedback_last_tick = now;
   MainTask();
-  assert(pitch_torque < 0); // Reversed motor direction.
-  std::cout << "pitch: DM4340 ranges/packing, calibration, hold, travel limits, reverse direction and recovery passed\n";
+  assert(pitch_torque < 0);
+  std::cout << "pitch: DM4340 feedback/packing, motor position/velocity loops, fixed IMU, gravity, travel limits and recovery passed\n";
+
 }
 """
 

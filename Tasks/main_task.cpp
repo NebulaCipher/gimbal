@@ -32,16 +32,23 @@ PID_Controller pitch_torque_pid;
 float position = 0.0f;       // IMU yaw target, rad
 float torque = 0.0f;
 float gimbal_omega = 0.0f;   // IMU yaw angular velocity, rad/s
+float yaw_target_omega = 0.0f; // Angle-loop output, rad/s
 float yaw_input = 0.0f;
 float pitch_input = 0.0f;
-float pitch_position = 0.0f; // IMU pitch target, rad
-float pitch_omega = 0.0f;    // IMU pitch angular velocity, rad/s
+float pitch_position = 0.0f; // DM4340 电机位置目标，rad
+float pitch_omega = 0.0f;    // DM4340 电机速度反馈，rad/s
+float pitch_target_omega = 0.0f; // 角度环输出，rad/s
+float pitch_pid_torque = 0.0f; // 叠加前馈之前的 PID 力矩，电机方向，N·m
 float pitch_torque = 0.0f;
-// 实测行程和方向后再开启 pitch 控制。
-bool pitch_control_enabled = false;
-float pitch_motor_min = 0.0f; // 电机位置下限，rad，需留出制动余量
-float pitch_motor_max = 0.0f; // 电机位置上限，rad，需留出制动余量
-float pitch_motor_direction = 1.0f; // 电机位置增加时 IMU pitch 增加为 1，否则为 -1
+// 行程已实测并留出余量；抬高时电机位置减小。板载 IMU 不随 pitch 转动。
+bool pitch_control_enabled = true;
+float pitch_motor_min = -0.836080313f; // 实测抬升端，rad
+float pitch_motor_max = 0.0557515621f; // 实测下落端，rad
+float pitch_motor_direction = -1.0f; // 枪管抬高时电机位置变化的方向，同时用于摇杆和前馈
+float pitch_gravity_gain = 7.0f; // 暂按估计值补偿，N·m，0 表示关闭
+float pitch_gravity_angle = 0.0f; // 最大重力矩处的电机位置，暂取 0 rad，需实测校准
+float pitch_gravity_torque = 0.0f; // 当前重力前馈，电机方向，N·m
+float pitch_torque_limit = 9.0f; // 7 N·m 前馈之外预留约 2 N·m 修正，总输出限幅
 static float pitch_motor_position = 0.0f;
 bool gimbal_ready = false;
 volatile uint32_t yaw_feedback_count = 0;
@@ -71,10 +78,13 @@ void Decode_Chassis(const uint8_t *data) {
 
 void MainInit(void) {
   yaw_pid.init(5.0f, 0.0f, 0.0f, 7.5f, 0.0f);
-  torque_pid.init(1.0f, 0.0f, 0.0f, 4.0f, 0.0f);
-  // pitch 初始参数：角速度限幅 0.5 rad/s，力矩限幅 1 N·m，需实车整定。
-  pitch_pid.init(3.0f, 0.0f, 0.0f, 0.5f, 0.0f);
-  pitch_torque_pid.init(1.0f, 0.0f, 0.0f, 1.0f, 0.0f);
+  // 速度环积分补偿持续扰动力矩：积分状态限幅 1，积分力矩最多 0.5 N·m。
+  // 仍需实车整定，总力矩限幅保持 4 N·m。
+  torque_pid.init(1.0f, 0.5f, 0.0f, 4.0f, 1.0f);
+  // 重力由前馈承担，先关闭积分核对反馈方向和阻尼，再按实车整定。
+  // 角度环与摇杆均限速 0.15 rad/s，避免小幅操作积累过快。
+  pitch_pid.init(2.0f, 0.0f, 0.0f, 0.15f, 0.0f);
+  pitch_torque_pid.init(4.0f, 0.0f, 0.0f, pitch_torque_limit, 0.0f);
   ImuInit();
   MX_IWDG_Init();
   CanFilter_Init(&hcan1);
@@ -98,12 +108,12 @@ void MainInit(void) {
 void MainTask(void) {
   tick++;
   ImuUpdate();
-  // IMU is on the gimbal: use its Z gyro, not relative motor speed or a
-  // derivative of the quantized board-to-board yaw angle.
-  gimbal_omega = gyro_data[2];
-  // 当前欧拉角约定下的 pitch 变化率；roll 接近 0 时等于 gyro Y。
-  pitch_omega = std::cos(euler_angles[2]) * gyro_data[1] -
-                std::sin(euler_angles[2]) * gyro_data[2];
+  // IMU 固定在 yaw 支架；支架倾斜时，机体系 gyro Z 不等于欧拉 yaw 的变化率。
+  // 换算到与角度外环相同的 yaw；分母限幅仅防止接近竖直时除零。
+  float cos_pitch = std::cos(euler_angles[1]);
+  if (cos_pitch < 0.1f) cos_pitch = 0.1f;
+  gimbal_omega = (std::sin(euler_angles[2]) * gyro_data[1] +
+                  std::cos(euler_angles[2]) * gyro_data[2]) / cos_pitch;
   const uint32_t irq_state = __get_PRIMASK();
   __disable_irq();
   const uint32_t now = HAL_GetTick();
@@ -115,11 +125,12 @@ void MainTask(void) {
   const float input = yaw_input;
   const float pitch_command = pitch_input;
   pitch_motor_position = pitch_motor_t.para.pos;
+  pitch_omega = pitch_motor_t.para.vel;
   const bool pitch_feedback_valid = pitch_feedback_count > 0 &&
       static_cast<uint32_t>(now - pitch_feedback_last_tick) <= 100;
   __set_PRIMASK(irq_state);
   const bool pitch_run = run && pitch_control_enabled && pitch_feedback_valid &&
-      std::isfinite(pitch_motor_position) &&
+      std::isfinite(pitch_motor_position) && std::isfinite(pitch_omega) &&
       std::isfinite(pitch_motor_min) && std::isfinite(pitch_motor_max) &&
       pitch_motor_min < pitch_motor_max &&
       pitch_motor_min >= DM4340_P_MIN && pitch_motor_max <= DM4340_P_MAX &&
@@ -138,6 +149,7 @@ void MainTask(void) {
     Gimbal_Yaw_Control();
   } else {
     position = euler_angles[0];
+    yaw_target_omega = 0.0f;
     torque = 0.0f;
     yaw_pid.reset();
     torque_pid.reset();
@@ -147,17 +159,21 @@ void MainTask(void) {
 
   if (pitch_run) {
     if (!pitch_running) {
-      pitch_position = euler_angles[1];
+      pitch_position = pitch_motor_position;
       pitch_pid.reset();
       pitch_torque_pid.reset();
     }
-    // 右摇杆垂直死区 0.2，最大目标角速度 0.5 rad/s。
+    // 已实测上推为正：按抬升方向减小电机位置目标，枪管抬高。
+    // 右摇杆垂直死区 0.2，最大目标角速度 0.15 rad/s。
     if (std::fabs(pitch_command) > 0.2f) {
-      pitch_position += pitch_command * 0.0005f;
+      pitch_position += pitch_motor_direction * pitch_command * 0.00015f;
     }
     Gimbal_Pitch_Control();
   } else {
-    pitch_position = euler_angles[1];
+    pitch_position = pitch_motor_position;
+    pitch_target_omega = 0.0f;
+    pitch_pid_torque = 0.0f;
+    pitch_gravity_torque = 0.0f;
     pitch_torque = 0.0f;
     pitch_pid.reset();
     pitch_torque_pid.reset();
@@ -168,28 +184,26 @@ void MainTask(void) {
 }
 
 void Gimbal_Yaw_Control() {
-  const float target_omega = yaw_pid.calculateRad(position, euler_angles[0], 0.001f);
-  torque = torque_pid.calculate(target_omega, gimbal_omega, 0.001f);
+  // 跟随、分离和小陀螺均保持 IMU 目标朝向；不要锁定相对电机角度。
+  yaw_target_omega = yaw_pid.calculateRad(position, euler_angles[0], 0.001f);
+  torque = torque_pid.calculate(yaw_target_omega, gimbal_omega, 0.001f);
   mit_ctrl(&hcan1, 3, 0, 0, 0, 0, torque);
 }
 
 void Gimbal_Pitch_Control() {
-  // 电机剩余行程换算为 IMU 目标角范围，按输出轴与 pitch 关节 1:1 计算。
-  float lower = euler_angles[1] + pitch_motor_direction *
-      (pitch_motor_min - pitch_motor_position);
-  float upper = euler_angles[1] + pitch_motor_direction *
-      (pitch_motor_max - pitch_motor_position);
-  if (lower > upper) {
-    float temp = lower;
-    lower = upper;
-    upper = temp;
-  }
-  if (pitch_position > upper) pitch_position = upper;
-  if (pitch_position < lower) pitch_position = lower;
+  // 目标、反馈和限位统一使用电机位置，不使用 yaw 支架上的 IMU pitch。
+  if (pitch_position > pitch_motor_max) pitch_position = pitch_motor_max;
+  if (pitch_position < pitch_motor_min) pitch_position = pitch_motor_min;
 
-  const float target_omega = pitch_pid.calculate(pitch_position, euler_angles[1], 0.001f);
-  pitch_torque = pitch_motor_direction *
-      pitch_torque_pid.calculate(target_omega, pitch_omega, 0.001f);
+  pitch_target_omega = pitch_pid.calculate(pitch_position, pitch_motor_position, 0.001f);
+  // 按输出轴与 pitch 关节 1:1 计算；电机零位不是已标定的重力矩基准。
+  pitch_gravity_torque = pitch_motor_direction * pitch_gravity_gain *
+      std::cos(pitch_motor_position - pitch_gravity_angle);
+  // 速度、力矩均采用电机自身方向，PID 输出不再额外反向。
+  pitch_pid_torque = pitch_torque_pid.calculate(pitch_target_omega, pitch_omega, 0.001f);
+  pitch_torque = pitch_pid_torque + pitch_gravity_torque;
+  if (pitch_torque > pitch_torque_limit) pitch_torque = pitch_torque_limit;
+  if (pitch_torque < -pitch_torque_limit) pitch_torque = -pitch_torque_limit;
   // 到达限位后禁止继续向外施力，允许向内退回。
   if ((pitch_motor_position <= pitch_motor_min && pitch_torque < 0.0f) ||
       (pitch_motor_position >= pitch_motor_max && pitch_torque > 0.0f)) {
