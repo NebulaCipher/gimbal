@@ -48,7 +48,6 @@ float pitch_motor_direction = -1.0f; // 枪管抬高时电机位置变化的方�
 float pitch_gravity_gain = 7.0f; // 暂按估计值补偿，N·m，0 表示关闭
 float pitch_gravity_angle = 0.0f; // 最大重力矩处的电机位置，暂取 0 rad，需实测校准
 float pitch_gravity_torque = 0.0f; // 当前重力前馈，电机方向，N·m
-float pitch_torque_limit = 9.0f; // 7 N·m 前馈之外预留约 2 N·m 修正，总输出限幅
 static float pitch_motor_position = 0.0f;
 bool gimbal_ready = false;
 volatile uint32_t yaw_feedback_count = 0;
@@ -79,14 +78,15 @@ void Decode_Chassis(const uint8_t *data) {
 void MainInit(void) {
   yaw_pid.init(5.0f, 0.0f, 0.0f, 7.5f, 0.0f);
   // 速度环积分补偿持续扰动力矩：积分状态限幅 1，积分力矩最多 0.5 N·m。
-  // 仍需实车整定，总力矩限幅保持 4 N·m。
-  torque_pid.init(1.0f, 0.5f, 0.0f, 4.0f, 1.0f);
+  // 去掉额外的 4 N·m 限制，输出范围采用电机 MIT 协议量程。
+  // 速度环 Kp 从 1 提至 2，增强阻尼和同一位置偏差下的回正力矩。
+  torque_pid.init(2.0f, 0.5f, 0.0f, T_MAX, 1.0f);
   // pitch 位置环用 P，速度环用 PI，重力仍由原前馈承担。
-  // 位置环 Kp=4，回正目标速度限幅 0.5 rad/s；摇杆目标仍按 0.15 rad/s 更新。
-  pitch_pid.init(4.0f, 0.0f, 0.0f, 0.5f, 0.0f);
-  // Kp=12 增强速度跟踪；Ki=2、积分状态限幅 0.5，积分力矩最多 1 N·m。
-  // 总力矩仍限幅 9 N·m；这组参数是待实车整定的初值。
-  pitch_torque_pid.init(12.0f, 2.0f, 0.0f, pitch_torque_limit, 0.5f);
+  // 位置环 Kp=6，回正目标速度限幅 0.8 rad/s；摇杆目标按 0.5 rad/s 更新。
+  pitch_pid.init(6.0f, 0.0f, 0.0f, 0.8f, 0.0f);
+  // Kp=16 增强速度跟踪；Ki=2、积分状态限幅 0.5，积分力矩最多 1 N·m。
+  // 去掉额外的 9 N·m 限制，输出范围采用电机 MIT 协议量程。
+  pitch_torque_pid.init(16.0f, 2.0f, 0.0f, DM4340_T_MAX, 0.5f);
   ImuInit();
   MX_IWDG_Init();
   CanFilter_Init(&hcan1);
@@ -110,12 +110,8 @@ void MainInit(void) {
 void MainTask(void) {
   tick++;
   ImuUpdate();
-  // IMU 固定在 yaw 支架；支架倾斜时，机体系 gyro Z 不等于欧拉 yaw 的变化率。
-  // 换算到与角度外环相同的 yaw；分母限幅仅防止接近竖直时除零。
-  float cos_pitch = std::cos(euler_angles[1]);
-  if (cos_pitch < 0.1f) cos_pitch = 0.1f;
-  gimbal_omega = (std::sin(euler_angles[2]) * gyro_data[1] +
-                  std::cos(euler_angles[2]) * gyro_data[2]) / cos_pitch;
+  // IMU 水平固定在 yaw 支架上，直接使用 Z 轴角速度，rad/s。
+  gimbal_omega = gyro_data[2];
   const uint32_t irq_state = __get_PRIMASK();
   __disable_irq();
   const uint32_t now = HAL_GetTick();
@@ -166,9 +162,9 @@ void MainTask(void) {
       pitch_torque_pid.reset();
     }
     // 已实测上推为正：按抬升方向减小电机位置目标，枪管抬高。
-    // 右摇杆垂直死区 0.2，最大目标角速度 0.15 rad/s。
+    // 右摇杆垂直死区 0.2，最大目标角速度 0.5 rad/s。
     if (std::fabs(pitch_command) > 0.2f) {
-      pitch_position += pitch_motor_direction * pitch_command * 0.00015f;
+      pitch_position += pitch_motor_direction * pitch_command * 0.0005f;
     }
     Gimbal_Pitch_Control();
   } else {
@@ -204,8 +200,9 @@ void Gimbal_Pitch_Control() {
   // 速度、力矩均采用电机自身方向，PID 输出不再额外反向。
   pitch_pid_torque = pitch_torque_pid.calculate(pitch_target_omega, pitch_omega, 0.001f);
   pitch_torque = pitch_pid_torque + pitch_gravity_torque;
-  if (pitch_torque > pitch_torque_limit) pitch_torque = pitch_torque_limit;
-  if (pitch_torque < -pitch_torque_limit) pitch_torque = -pitch_torque_limit;
+  // 仅约束到 MIT 可编码的力矩范围，避免超过 12 位量程后编码回绕。
+  if (pitch_torque > DM4340_T_MAX) pitch_torque = DM4340_T_MAX;
+  if (pitch_torque < DM4340_T_MIN) pitch_torque = DM4340_T_MIN;
   // 到达限位后禁止继续向外施力，允许向内退回。
   if ((pitch_motor_position <= pitch_motor_min && pitch_torque < 0.0f) ||
       (pitch_motor_position >= pitch_motor_max && pitch_torque > 0.0f)) {

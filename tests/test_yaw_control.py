@@ -71,7 +71,6 @@ extern float pitch_motor_min, pitch_motor_max, pitch_motor_direction;
 extern float pitch_position, pitch_omega, pitch_torque;
 extern float pitch_target_omega, pitch_pid_torque;
 extern float pitch_gravity_gain, pitch_gravity_angle, pitch_gravity_torque;
-extern float pitch_torque_limit;
 extern PID_Controller pitch_torque_pid;
 CAN_HandleTypeDef hcan1, hcan2;
 TIM_HandleTypeDef htim6;
@@ -104,7 +103,7 @@ void enable_motor_mode(CAN_HandleTypeDef *, uint16_t id, uint16_t) {
 void mit_ctrl(CAN_HandleTypeDef *, uint16_t id, float p, float v,
               float kp, float kd, float t) {
   assert(id == 3 && p == 0 && v == 0 && kp == 0 && kd == 0);
-  assert(std::isfinite(t) && std::fabs(t) <= 4.0f);
+  assert(std::isfinite(t) && t >= T_MIN && t <= T_MAX);
   sent_torque = t;
 }
 void CAN_Send_Msg(CAN_HandleTypeDef *bus, uint8_t *data, uint32_t id, uint8_t len) {
@@ -156,7 +155,7 @@ void pitch_step(bool enabled, float input) {
 }
 int main() {
   MainInit();
-  assert(pitch_gravity_gain == 7.0f && pitch_torque_limit == 9.0f);
+  assert(pitch_gravity_gain == 7.0f);
   // Isolate feedback-only regressions before testing the configured feedforward.
   pitch_gravity_gain = 0;
   assert(enables == 1);
@@ -203,32 +202,36 @@ int main() {
   assert(watchdog_refreshes > 0);
   std::cout << "yaw task: startup, control, disable, timeouts, recovery, wrap and telemetry passed\n";
 
-  // A pitched/rolled IMU must report Euler yaw rate, not local gyro Z.
+  // The IMU is horizontal on the yaw bracket: use gyro Z directly.
   command(false);
   step();
   euler_angles[0] = 0.6f;
-  euler_angles[1] = 0.5f;
-  euler_angles[2] = 0.3f;
+  euler_angles[1] = euler_angles[2] = 0;
   command(true);
   step();
   const float held_yaw = position;
-  gyro_data[0] = -2.0f * std::sin(euler_angles[1]);
-  gyro_data[1] = 2.0f * std::sin(euler_angles[2]) * std::cos(euler_angles[1]);
-  gyro_data[2] = 2.0f * std::cos(euler_angles[2]) * std::cos(euler_angles[1]);
+  gyro_data[1] = 3.0f; // Other gyro axes are not yaw feedback.
+  gyro_data[2] = 2.0f;
   step();
-  assert(std::fabs(gimbal_omega - 2.0f) < 1e-6f && sent_torque < 0);
+  assert(gimbal_omega == 2.0f && sent_torque < 0);
   assert(position == held_yaw && yaw_target_omega == 0);
-  // Pure pitch motion must not masquerade as yaw motion when roll is nonzero.
-  gyro_data[0] = 0;
-  gyro_data[1] = 0.4f * std::cos(euler_angles[2]);
-  gyro_data[2] = -0.4f * std::sin(euler_angles[2]);
+  gyro_data[2] = 0;
   step();
-  assert(std::fabs(gimbal_omega) < 1e-6f);
-  euler_angles[1] = 1.57079632679f;
-  step(); // Near-vertical guard must keep control finite and bounded.
-  assert(std::isfinite(gimbal_omega));
+  assert(gimbal_omega == 0 && position == held_yaw);
   std::memset(gyro_data, 0, sizeof(gyro_data));
-  euler_angles[1] = euler_angles[2] = 0;
+
+  // The old +/-4 Nm application cap is removed. Large errors can use the
+  // full configured protocol torque range, in both directions.
+  command(false);
+  step();
+  command(true);
+  step();
+  euler_angles[0] = position - 1.0f;
+  step();
+  assert(sent_torque == T_MAX && sent_torque > 4.0f);
+  euler_angles[0] = position + 1.0f;
+  step();
+  assert(sent_torque == T_MIN && sent_torque < -4.0f);
 
   // Cross +/-pi using the short angular error; the target must stay fixed.
   command(false);
@@ -239,6 +242,24 @@ int main() {
   euler_angles[0] = -3.14159265359f + 0.02f;
   step();
   assert(yaw_target_omega < -0.19f && yaw_target_omega > -0.21f);
+
+  // A held heading must oppose both displacement and continued pushing.
+  // At a small 0.05 rad offset the new speed gain gives about 0.5 Nm,
+  // twice the archived proportional response, without moving the target.
+  command(false);
+  step();
+  euler_angles[0] = 0.6f;
+  gyro_data[2] = 0;
+  command(true);
+  step();
+  const float yaw_hold_target = position;
+  euler_angles[0] += 0.05f;
+  step();
+  assert(position == yaw_hold_target);
+  assert(sent_torque < -0.49f && sent_torque > -0.51f);
+  gyro_data[2] = 0.1f;
+  step();
+  assert(position == yaw_hold_target && sent_torque < -0.69f);
 
   // Illustrative joint dynamics, not a model of the real vehicle. Verify that
   // a displaced heading recovers despite a constant 0.2 Nm load, both with a
@@ -273,13 +294,13 @@ int main() {
     if (i % 10 == 0) command(true);
     step();
   }
-  assert(std::fabs(sent_torque - yaw_target_omega) <= 0.50001f);
+  assert(std::fabs(sent_torque - 2.0f * yaw_target_omega) <= 0.50001f);
   command(false);
   step();
   command(true);
   step();
   assert(sent_torque == 0);
-  std::cout << "yaw hold: tilted IMU, wrap, disturbance recovery, rotating chassis and bounded/reset integral passed\n";
+  std::cout << "yaw hold: horizontal IMU, protocol torque range, wrap, disturbance recovery, rotating chassis and bounded/reset integral passed\n";
 
   // Feedback packing and independent model ranges (yaw stays unchanged).
   uint8_t raw_pitch[8] = {0x19, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 45, 50};
@@ -331,20 +352,35 @@ int main() {
   assert(pitch_position == held && pitch_omega == 0 && pitch_torque == 0);
   gyro_data[1] = 0;
 
+  // Full upward stick moves the pitch target at 0.5 rad/s, independently
+  // of the faster outer-loop catch-up limit. Return to center holds it.
+  pitch_step(false, 0);
+  pitch_motor_t.para.pos = motor_middle;
+  pitch_step(true, 0);
+  for (int i = 0; i < 200; ++i) pitch_step(true, 1);
+  assert(std::fabs(pitch_position - (motor_middle - 0.1f)) < 2e-5f);
+  const float stick_target = pitch_position;
+  pitch_step(true, 0);
+  assert(pitch_position == stick_target);
+  pitch_step(false, 0);
+  pitch_step(true, 0);
+
   // A blocked motor accumulates at most 1 Nm integral correction.
   pitch_position = motor_middle - 0.3f;
   for (int i = 0; i < 10000; ++i) {
     pitch_step(true, 0);
-    assert(pitch_torque < -5.99f && pitch_torque >= -7.00001f);
+    assert(pitch_torque < -12.79f && pitch_torque >= -13.80001f);
+    assert(pitch_torque < -9.0f); // No former 9 Nm application cap.
     assert(std::fabs(pitch_torque_pid.getIntegral()) <= 0.50001f);
   }
-  assert(std::fabs(pitch_torque + 7.0f) < 1e-5f);
-  assert(std::fabs(pitch_target_omega + 0.5f) < 1e-6f);
+  assert(pitch_torque_pid.getIntegral() == -0.5f);
+  assert(std::fabs(pitch_torque + 13.8f) < 1e-5f);
+  assert(std::fabs(pitch_target_omega + 0.8f) < 1e-6f);
   const int lift_raw = ((pitch_frame[6] & 15) << 8) | pitch_frame[7];
   assert(std::fabs(uint_to_float(lift_raw, -28, 28, 12) - pitch_torque) < 0.014f);
   pitch_motor_t.para.vel = 5;
   pitch_step(true, 0);
-  assert(pitch_torque == -pitch_torque_limit);
+  assert(pitch_torque == -DM4340_T_MAX);
   pitch_motor_t.para.vel = 0;
 
   // Illustrative motor dynamics, matched gravity, fixed bracket IMU.
@@ -361,9 +397,9 @@ int main() {
     now++;
     pitch_feedback_last_tick = now;
     pitch_step(true, 0);
-    assert(std::fabs(pitch_torque) <= pitch_torque_limit);
+    assert(std::fabs(pitch_torque) <= DM4340_T_MAX);
     assert(pitch_position == target);
-    assert(std::fabs(pitch_target_omega) <= 0.5f);
+    assert(std::fabs(pitch_target_omega) <= 0.8f);
     const float load = 7.0f * std::cos(pitch_motor_t.para.pos - motor_middle);
     pitch_motor_t.para.vel += (pitch_torque + load -
         0.2f * pitch_motor_t.para.vel) / 0.2f * 0.001f;
@@ -376,18 +412,18 @@ int main() {
 
   // Push the gun downward at a fixed target, then release it. The controller
   // must restore the held position, with an immediate proportional response
-  // and the same production gravity feedforward / 9 Nm total torque limit.
+  // and the same production gravity feedforward / protocol torque range.
   pitch_motor_t.para.pos += 0.03f;
   pitch_motor_t.para.vel = 0;
   pitch_step(true, 0);
-  assert(pitch_target_omega < -0.11f && pitch_pid_torque < -1.3f);
+  assert(pitch_target_omega < -0.17f && pitch_pid_torque < -2.5f);
   for (int i = 0; i < 5000; ++i) {
     now++;
     pitch_feedback_last_tick = now;
     pitch_step(true, 0);
     assert(pitch_position == target);
-    assert(std::fabs(pitch_target_omega) <= 0.5f);
-    assert(std::fabs(pitch_torque) <= pitch_torque_limit);
+    assert(std::fabs(pitch_target_omega) <= 0.8f);
+    assert(std::fabs(pitch_torque) <= DM4340_T_MAX);
     const float load = 7.0f * std::cos(pitch_motor_t.para.pos - motor_middle);
     pitch_motor_t.para.vel += (pitch_torque + load -
         0.2f * pitch_motor_t.para.vel) / 0.2f * 0.001f;
@@ -418,8 +454,8 @@ int main() {
       pitch_feedback_last_tick = now;
       pitch_step(true, 0);
       assert(pitch_position == held_target);
-      assert(std::fabs(pitch_target_omega) <= 0.500001f);
-      assert(std::fabs(pitch_torque) <= pitch_torque_limit);
+      assert(std::fabs(pitch_target_omega) <= 0.800001f);
+      assert(std::fabs(pitch_torque) <= DM4340_T_MAX);
       assert(std::fabs(pitch_torque_pid.getIntegral()) <= 0.50001f);
       const float load = 8.0f * std::cos(pitch_motor_t.para.pos - motor_middle);
       pitch_motor_t.para.vel += (pitch_torque + load -
@@ -452,9 +488,9 @@ int main() {
   pitch_motor_t.para.pos = pitch_position = -0.2f;
   pitch_step(true, 0);
   assert(std::fabs(pitch_gravity_torque + 7.0f * std::cos(0.2f)) < 1e-6f);
-  pitch_gravity_gain = 2 * pitch_torque_limit;
+  pitch_gravity_gain = 2 * DM4340_T_MAX;
   pitch_step(true, 0);
-  assert(pitch_torque == -pitch_torque_limit);
+  assert(pitch_torque == -DM4340_T_MAX);
   pitch_gravity_gain = 7;
   pitch_motor_t.para.pos = pitch_motor_min;
   pitch_position = pitch_motor_min;
