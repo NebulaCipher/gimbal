@@ -18,9 +18,13 @@
 
 #include "dm4310_drv.hpp"
 #include "main_task.hpp"
+#include "dm4340_drv.hpp"
 extern Joint_Motor_t yaw_motor_t;
 extern volatile uint32_t yaw_feedback_count;
 extern volatile uint32_t yaw_feedback_last_tick;
+extern DM4340_Motor_t pitch_motor_t;
+extern volatile uint32_t pitch_feedback_count;
+extern volatile uint32_t pitch_feedback_last_tick;
 /* Private macro -------------------------------------------------------------*/
 /* Private constants ---------------------------------------------------------*/
 /* Private types -------------------------------------------------------------*/
@@ -120,8 +124,12 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan) {
     if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rx_header2, can2_rx_data) ==
         HAL_OK) // 获得接收到的数据头和数据
     {
-      if (rx_header2.StdId == 0x200) { // 帧头校验
-        // 校验通过进行具体数据处理
+      if (rx_header2.IDE == CAN_ID_STD && rx_header2.RTR == CAN_RTR_DATA &&
+          rx_header2.DLC == 8 && rx_header2.StdId == 0x19 &&
+          (can2_rx_data[0] & 0x0F) == 9) {
+        dm4340_fbdata(&pitch_motor_t, can2_rx_data, rx_header2.DLC);
+        pitch_feedback_last_tick = HAL_GetTick();
+        pitch_feedback_count++;
       }
     }
   }

@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Resources/Src/HW_can.cpp
     Resources/Src/PID.cpp
     Resources/Src/dm4310_drv.cpp
+    Resources/Src/dm4340_drv.cpp
     components/imu/src/BMI088.cpp
     components/tick/tick.cpp
     components/ahrs/src/ahrs_base.cpp
