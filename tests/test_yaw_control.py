@@ -202,7 +202,7 @@ int main() {
   assert(watchdog_refreshes > 0);
   std::cout << "yaw task: startup, control, disable, timeouts, recovery, wrap and telemetry passed\n";
 
-  // The IMU is horizontal on the yaw bracket: use gyro Z directly.
+  // Horizontal attitude reduces Euler yaw rate to gyro Z.
   command(false);
   step();
   euler_angles[0] = 0.6f;
@@ -210,7 +210,7 @@ int main() {
   command(true);
   step();
   const float held_yaw = position;
-  gyro_data[1] = 3.0f; // Other gyro axes are not yaw feedback.
+  gyro_data[1] = 3.0f; // At zero roll, gyro Y does not contribute to yaw rate.
   gyro_data[2] = 2.0f;
   step();
   assert(gimbal_omega == 2.0f && sent_torque < 0);
@@ -218,7 +218,33 @@ int main() {
   gyro_data[2] = 0;
   step();
   assert(gimbal_omega == 0 && position == held_yaw);
+  // A pitched/rolled IMU must report Euler yaw rate, not local gyro Z.
+  euler_angles[1] = 0.5f;
+  euler_angles[2] = 0.3f;
+  gyro_data[0] = -2.0f * std::sin(euler_angles[1]);
+  gyro_data[1] = 2.0f * std::sin(euler_angles[2]) * std::cos(euler_angles[1]);
+  gyro_data[2] = 2.0f * std::cos(euler_angles[2]) * std::cos(euler_angles[1]);
+  step();
+  assert(std::fabs(gimbal_omega - 2.0f) < 1e-6f && sent_torque < 0);
+  assert(position == held_yaw && yaw_target_omega == 0);
+  // Pure pitch motion must not masquerade as yaw motion at nonzero roll.
+  gyro_data[0] = 0;
+  gyro_data[1] = 0.4f * std::cos(euler_angles[2]);
+  gyro_data[2] = -0.4f * std::sin(euler_angles[2]);
+  step();
+  assert(std::fabs(gimbal_omega) < 1e-6f && position == held_yaw);
+  // Near-vertical guard keeps the feedback finite and the command bounded.
+  for (float pitch : {-1.57079632679f, 1.57079632679f}) {
+    euler_angles[1] = pitch;
+    gyro_data[1] = 0;
+    gyro_data[2] = 1;
+    step();
+    assert(std::isfinite(gimbal_omega));
+    assert(std::fabs(gimbal_omega - std::cos(0.3f) / 0.1f) < 1e-5f);
+    assert(std::fabs(sent_torque) <= T_MAX && position == held_yaw);
+  }
   std::memset(gyro_data, 0, sizeof(gyro_data));
+  euler_angles[1] = euler_angles[2] = 0;
 
   // The old +/-4 Nm application cap is removed. Large errors can use the
   // full configured protocol torque range, in both directions.
@@ -244,8 +270,8 @@ int main() {
   assert(yaw_target_omega < -0.31f && yaw_target_omega > -0.33f);
 
   // A held heading must oppose both displacement and continued pushing.
-  // At a small 0.05 rad offset the two gains give about 1.6 Nm,
-  // 3.2 times the archived proportional response, without moving the target.
+  // At a small 0.05 rad offset the selected gains give about 1.6 Nm,
+  // without moving the held target.
   command(false);
   step();
   euler_angles[0] = 0.6f;
@@ -260,6 +286,10 @@ int main() {
   gyro_data[2] = 0.1f;
   step();
   assert(position == yaw_hold_target && sent_torque < -1.99f);
+  gyro_data[2] = 0;
+  euler_angles[0] = yaw_hold_target + 0.3f;
+  step();
+  assert(position == yaw_hold_target && sent_torque == T_MIN);
 
   // Illustrative joint dynamics, not a model of the real vehicle. Verify that
   // a displaced heading recovers despite a constant 0.2 Nm load, both with a
@@ -288,7 +318,7 @@ int main() {
     assert(std::fabs(sent_torque + 0.2f) < 0.01f);
   }
   // A blocked joint cannot accumulate more than 0.5 Nm integral torque.
-  euler_angles[0] = position - 0.2f;
+  euler_angles[0] = position - 0.1f; // Keep the proportional output unsaturated.
   gyro_data[2] = 0;
   for (int i = 0; i < 3000; ++i) {
     if (i % 10 == 0) command(true);
@@ -300,7 +330,7 @@ int main() {
   command(true);
   step();
   assert(sent_torque == 0);
-  std::cout << "yaw hold: horizontal IMU, protocol torque range, wrap, disturbance recovery, rotating chassis and bounded/reset integral passed\n";
+  std::cout << "yaw hold: Euler yaw rate at horizontal/tilted attitudes, vertical guard, protocol torque range, wrap, disturbance recovery, rotating chassis and bounded/reset integral passed\n";
 
   // Feedback packing and independent model ranges (yaw stays unchanged).
   uint8_t raw_pitch[8] = {0x19, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 45, 50};
@@ -317,7 +347,7 @@ int main() {
   assert(pitch_motor_t.para.pos == DM4340_P_MIN);
   assert(pitch_motor_t.para.vel == -10 && pitch_motor_t.para.tor == -28);
 
-  // The IMU stays on the yaw bracket: pitch must use DM4340 pos/vel only.
+  // Pitch retains motor-relative control: use DM4340 pos/vel only.
   const float motor_middle = (pitch_motor_min + pitch_motor_max) * 0.5f;
   pitch_motor_t.para.pos = motor_middle;
   pitch_motor_t.para.vel = 0;
@@ -352,13 +382,13 @@ int main() {
   assert(pitch_position == held && pitch_omega == 0 && pitch_torque == 0);
   gyro_data[1] = 0;
 
-  // Full upward stick moves the pitch target at 0.8 rad/s, independently
+  // Full upward stick moves the pitch target at 1.0 rad/s, independently
   // of the faster outer-loop catch-up limit. Return to center holds it.
   pitch_step(false, 0);
   pitch_motor_t.para.pos = motor_middle;
   pitch_step(true, 0);
   for (int i = 0; i < 200; ++i) pitch_step(true, 1);
-  assert(std::fabs(pitch_position - (motor_middle - 0.16f)) < 2e-5f);
+  assert(std::fabs(pitch_position - (motor_middle - 0.2f)) < 2e-5f);
   const float stick_target = pitch_position;
   pitch_step(true, 0);
   assert(pitch_position == stick_target);
@@ -413,7 +443,7 @@ int main() {
     if (i == 499) assert(std::fabs(pitch_motor_t.para.pos - target) < 0.002f);
   }
   assert(std::fabs(pitch_motor_t.para.pos - target) < 0.002f);
-  assert(euler_angles[1] == -0.036f); // No gun-mounted IMU required.
+  assert(euler_angles[1] == -0.036f); // Pitch does not depend on IMU attitude.
 
   // Push the gun downward at a fixed target, then release it. The controller
   // must restore the held position, with an immediate proportional response
