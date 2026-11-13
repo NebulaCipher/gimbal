@@ -241,11 +241,11 @@ int main() {
   step();
   euler_angles[0] = -3.14159265359f + 0.02f;
   step();
-  assert(yaw_target_omega < -0.19f && yaw_target_omega > -0.21f);
+  assert(yaw_target_omega < -0.31f && yaw_target_omega > -0.33f);
 
   // A held heading must oppose both displacement and continued pushing.
-  // At a small 0.05 rad offset the new speed gain gives about 0.5 Nm,
-  // twice the archived proportional response, without moving the target.
+  // At a small 0.05 rad offset the two gains give about 1.6 Nm,
+  // 3.2 times the archived proportional response, without moving the target.
   command(false);
   step();
   euler_angles[0] = 0.6f;
@@ -256,10 +256,10 @@ int main() {
   euler_angles[0] += 0.05f;
   step();
   assert(position == yaw_hold_target);
-  assert(sent_torque < -0.49f && sent_torque > -0.51f);
+  assert(sent_torque < -1.59f && sent_torque > -1.61f);
   gyro_data[2] = 0.1f;
   step();
-  assert(position == yaw_hold_target && sent_torque < -0.69f);
+  assert(position == yaw_hold_target && sent_torque < -1.99f);
 
   // Illustrative joint dynamics, not a model of the real vehicle. Verify that
   // a displaced heading recovers despite a constant 0.2 Nm load, both with a
@@ -294,7 +294,7 @@ int main() {
     if (i % 10 == 0) command(true);
     step();
   }
-  assert(std::fabs(sent_torque - 2.0f * yaw_target_omega) <= 0.50001f);
+  assert(std::fabs(sent_torque - 4.0f * yaw_target_omega) <= 0.50001f);
   command(false);
   step();
   command(true);
@@ -352,32 +352,36 @@ int main() {
   assert(pitch_position == held && pitch_omega == 0 && pitch_torque == 0);
   gyro_data[1] = 0;
 
-  // Full upward stick moves the pitch target at 0.5 rad/s, independently
+  // Full upward stick moves the pitch target at 0.8 rad/s, independently
   // of the faster outer-loop catch-up limit. Return to center holds it.
   pitch_step(false, 0);
   pitch_motor_t.para.pos = motor_middle;
   pitch_step(true, 0);
   for (int i = 0; i < 200; ++i) pitch_step(true, 1);
-  assert(std::fabs(pitch_position - (motor_middle - 0.1f)) < 2e-5f);
+  assert(std::fabs(pitch_position - (motor_middle - 0.16f)) < 2e-5f);
   const float stick_target = pitch_position;
   pitch_step(true, 0);
   assert(pitch_position == stick_target);
   pitch_step(false, 0);
   pitch_step(true, 0);
 
-  // A blocked motor accumulates at most 1 Nm integral correction.
-  pitch_position = motor_middle - 0.3f;
+  // The diagnostic P-only speed loop must not accumulate integral correction.
+  pitch_position = motor_middle - 0.1f;
   for (int i = 0; i < 10000; ++i) {
     pitch_step(true, 0);
-    assert(pitch_torque < -12.79f && pitch_torque >= -13.80001f);
+    assert(std::fabs(pitch_torque + 9.6f) < 1e-4f);
     assert(pitch_torque < -9.0f); // No former 9 Nm application cap.
-    assert(std::fabs(pitch_torque_pid.getIntegral()) <= 0.50001f);
+    assert(pitch_torque_pid.getIntegral() == 0);
   }
-  assert(pitch_torque_pid.getIntegral() == -0.5f);
-  assert(std::fabs(pitch_torque + 13.8f) < 1e-5f);
+  assert(pitch_torque_pid.getIntegral() == 0);
+  assert(std::fabs(pitch_torque + 9.6f) < 1e-4f);
   assert(std::fabs(pitch_target_omega + 0.8f) < 1e-6f);
   const int lift_raw = ((pitch_frame[6] & 15) << 8) | pitch_frame[7];
   assert(std::fabs(uint_to_float(lift_raw, -28, 28, 12) - pitch_torque) < 0.014f);
+  pitch_position = motor_middle - 0.3f;
+  pitch_step(true, 0);
+  assert(std::fabs(pitch_target_omega + 1.2f) < 1e-6f);
+  assert(std::fabs(pitch_torque + 14.4f) < 1e-4f); // Catch-up speed is limited.
   pitch_motor_t.para.vel = 5;
   pitch_step(true, 0);
   assert(pitch_torque == -DM4340_T_MAX);
@@ -399,13 +403,14 @@ int main() {
     pitch_step(true, 0);
     assert(std::fabs(pitch_torque) <= DM4340_T_MAX);
     assert(pitch_position == target);
-    assert(std::fabs(pitch_target_omega) <= 0.8f);
+    assert(std::fabs(pitch_target_omega) <= 1.2f);
     const float load = 7.0f * std::cos(pitch_motor_t.para.pos - motor_middle);
     pitch_motor_t.para.vel += (pitch_torque + load -
         0.2f * pitch_motor_t.para.vel) / 0.2f * 0.001f;
     pitch_motor_t.para.pos += pitch_motor_t.para.vel * 0.001f;
     assert(pitch_motor_t.para.pos > pitch_motor_min &&
            pitch_motor_t.para.pos < pitch_motor_max);
+    if (i == 499) assert(std::fabs(pitch_motor_t.para.pos - target) < 0.002f);
   }
   assert(std::fabs(pitch_motor_t.para.pos - target) < 0.002f);
   assert(euler_angles[1] == -0.036f); // No gun-mounted IMU required.
@@ -416,13 +421,13 @@ int main() {
   pitch_motor_t.para.pos += 0.03f;
   pitch_motor_t.para.vel = 0;
   pitch_step(true, 0);
-  assert(pitch_target_omega < -0.17f && pitch_pid_torque < -2.5f);
+  assert(pitch_target_omega < -0.23f && pitch_pid_torque < -2.8f);
   for (int i = 0; i < 5000; ++i) {
     now++;
     pitch_feedback_last_tick = now;
     pitch_step(true, 0);
     assert(pitch_position == target);
-    assert(std::fabs(pitch_target_omega) <= 0.8f);
+    assert(std::fabs(pitch_target_omega) <= 1.2f);
     assert(std::fabs(pitch_torque) <= DM4340_T_MAX);
     const float load = 7.0f * std::cos(pitch_motor_t.para.pos - motor_middle);
     pitch_motor_t.para.vel += (pitch_torque + load -
@@ -439,7 +444,8 @@ int main() {
   assert(std::fabs(pitch_pid_torque) < 1e-6f);
   assert(std::fabs(pitch_torque - pitch_gravity_torque) < 1e-6f);
 
-  // A 1 Nm gravity/load mismatch must not leave the P-only steady error.
+  // With integral disabled, a 1 Nm gravity/load mismatch leaves a predictable
+  // steady position error. Verify force balance and zero integral state.
   // Keep the production 7 Nm feedforward and fixed bracket IMU; simulate
   // an 8 Nm load, exercising both lifting and lowering with the same gains.
   for (float direction : {-1.0f, 1.0f}) {
@@ -454,9 +460,9 @@ int main() {
       pitch_feedback_last_tick = now;
       pitch_step(true, 0);
       assert(pitch_position == held_target);
-      assert(std::fabs(pitch_target_omega) <= 0.800001f);
+      assert(std::fabs(pitch_target_omega) <= 1.200001f);
       assert(std::fabs(pitch_torque) <= DM4340_T_MAX);
-      assert(std::fabs(pitch_torque_pid.getIntegral()) <= 0.50001f);
+      assert(pitch_torque_pid.getIntegral() == 0);
       const float load = 8.0f * std::cos(pitch_motor_t.para.pos - motor_middle);
       pitch_motor_t.para.vel += (pitch_torque + load -
           0.2f * pitch_motor_t.para.vel) / 0.2f * 0.001f;
@@ -464,10 +470,11 @@ int main() {
       assert(pitch_motor_t.para.pos > pitch_motor_min &&
              pitch_motor_t.para.pos < pitch_motor_max);
     }
-    assert(std::fabs(pitch_motor_t.para.pos - held_target) < 0.002f);
+    const float expected_error = std::cos(pitch_motor_t.para.pos - motor_middle) / 96.0f;
+    assert(std::fabs((pitch_motor_t.para.pos - held_target) - expected_error) < 0.0002f);
     assert(std::fabs(pitch_motor_t.para.vel) < 0.001f);
     assert(euler_angles[1] == -0.036f);
-    assert(std::fabs(pitch_torque_pid.getIntegral()) > 0.4f);
+    assert(pitch_torque_pid.getIntegral() == 0);
     pitch_step(false, 0);
     assert(pitch_torque == 0 && pitch_torque_pid.getIntegral() == 0);
     pitch_motor_t.para.vel = 0;
@@ -563,7 +570,7 @@ int main() {
   yaw_feedback_last_tick = now;
   MainTask();
   assert(pitch_torque < 0);
-  std::cout << "pitch: DM4340 feedback/packing, cascaded P/PI, bounded/reset integral, load mismatch recovery, fixed IMU, gravity and travel limits passed\n";
+  std::cout << "pitch: DM4340 feedback/packing, cascaded P/P, disabled integral, load mismatch force balance, fixed IMU, gravity and travel limits passed\n";
 
 }
 """

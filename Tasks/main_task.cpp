@@ -76,17 +76,17 @@ void Decode_Chassis(const uint8_t *data) {
 }
 
 void MainInit(void) {
-  yaw_pid.init(5.0f, 0.0f, 0.0f, 7.5f, 0.0f);
+  yaw_pid.init(8.0f, 0.0f, 0.0f, 7.5f, 0.0f);
   // 速度环积分补偿持续扰动力矩：积分状态限幅 1，积分力矩最多 0.5 N·m。
   // 去掉额外的 4 N·m 限制，输出范围采用电机 MIT 协议量程。
-  // 速度环 Kp 从 1 提至 2，增强阻尼和同一位置偏差下的回正力矩。
-  torque_pid.init(2.0f, 0.5f, 0.0f, T_MAX, 1.0f);
-  // pitch 位置环用 P，速度环用 PI，重力仍由原前馈承担。
-  // 位置环 Kp=6，回正目标速度限幅 0.8 rad/s；摇杆目标按 0.5 rad/s 更新。
-  pitch_pid.init(6.0f, 0.0f, 0.0f, 0.8f, 0.0f);
-  // Kp=16 增强速度跟踪；Ki=2、积分状态限幅 0.5，积分力矩最多 1 N·m。
+  // 角度环 Kp=8、速度环 Kp=4，同时增强位置回正和速度阻尼。
+  torque_pid.init(4.0f, 0.5f, 0.0f, T_MAX, 1.0f);
+  // pitch 两环暂时都用 P，重力仍由原前馈承担，先排查积分对振荡的影响。
+  // 位置环 Kp=8，降低回正增益；目标速度限幅 1.2 rad/s，摇杆按 0.8 rad/s 更新。
+  pitch_pid.init(8.0f, 0.0f, 0.0f, 1.2f, 0.0f);
+  // 速度环 Kp 保持 12；Ki 从 2 暂降为 0，积分状态限幅也置 0。
   // 去掉额外的 9 N·m 限制，输出范围采用电机 MIT 协议量程。
-  pitch_torque_pid.init(16.0f, 2.0f, 0.0f, DM4340_T_MAX, 0.5f);
+  pitch_torque_pid.init(12.0f, 0.0f, 0.0f, DM4340_T_MAX, 0.0f);
   ImuInit();
   MX_IWDG_Init();
   CanFilter_Init(&hcan1);
@@ -162,9 +162,9 @@ void MainTask(void) {
       pitch_torque_pid.reset();
     }
     // 已实测上推为正：按抬升方向减小电机位置目标，枪管抬高。
-    // 右摇杆垂直死区 0.2，最大目标角速度 0.5 rad/s。
+    // 右摇杆垂直死区 0.2，最大目标角速度 0.8 rad/s。
     if (std::fabs(pitch_command) > 0.2f) {
-      pitch_position += pitch_motor_direction * pitch_command * 0.0005f;
+      pitch_position += pitch_motor_direction * pitch_command * 0.0008f;
     }
     Gimbal_Pitch_Control();
   } else {
